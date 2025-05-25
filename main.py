@@ -3,8 +3,6 @@ import discord
 import os
 import asyncio
 import yt_dlp
-import json
-import os.path
 from playlist import PlaylistManager
 from dotenv import load_dotenv
 from discord.ext import commands
@@ -21,7 +19,6 @@ def run_bot():
     # client = discord.Client(intents=intents)
     bot = commands.Bot(command_prefix='?', intents=intents)
 
-    voice_clients = {}
     yt_dl_options = {
         "format": "bestaudio/best",
         "noplaylist": True
@@ -31,6 +28,7 @@ def run_bot():
     ffmpeg_options = {'options': '-vn'}
 
     queues = {}
+    playlist_states = {}
     bot.playlist_manager = None
 
 
@@ -82,6 +80,14 @@ def run_bot():
 
 
     def play_next(ctx):
+            guild_id = ctx.guild.id
+
+            if len(queues.get(guild_id, [])) <= 1:
+                asyncio.run_coroutine_threadsafe(
+                    load_more_songs(ctx, count=2),
+                    bot.loop
+                )
+
             if len(queues[ctx.guild.id]) > 0:
                 voice_client = ctx.voice_client
 
@@ -116,8 +122,11 @@ def run_bot():
         if ctx.voice_client:
             await ctx.voice_client.disconnect()
             
-            if ctx.guild.id in queues:
-                queues[ctx.guild.id] = []
+            guild_id = ctx.guild.id
+            if guild_id in queues:
+                queues[guild_id] = []
+            if guild_id in playlist_states:  # NEW: Clean up playlist state
+                del playlist_states[guild_id]
 
 
     @bot.command(name='resume')
@@ -127,11 +136,12 @@ def run_bot():
             # await ctx.send("Playback resumed.")
         else:
             await ctx.send("Nothing is paused right now.", silent=True)
-            
+
 
     @bot.command(name='queue')
     async def queue(ctx):
         pass
+
 
     @bot.command(name='skip')
     async def skip(ctx):
@@ -140,7 +150,6 @@ def run_bot():
             await ctx.send("Skipped to the next song", silent=True)
         else:
             await ctx.send("Nothing is playing to skip", silent=True)
-
 
 
     @bot.group(name='playlist', invoke_without_command=True)
@@ -158,6 +167,7 @@ def run_bot():
             "?playlist play [name] --shuffle - Play all songs in random order",
             silent=True
         )
+
 
     @playlist.command(name='create')
     async def playlist_create(ctx, *, name):
@@ -252,6 +262,7 @@ def run_bot():
             await ctx.send(f"An error occurred: {str(e)}")
             print(e)
 
+
     @playlist.command(name='remove')
     async def playlist_remove(ctx, playlist_name, index: int):
         """Remove a song from a playlist by index (starting from 1)"""
@@ -263,6 +274,7 @@ def run_bot():
             await ctx.send(f"Song removed from playlist '{playlist_name}'", silent=True)
         else:
             await ctx.send(f"Failed to remove song. Check that the playlist exists and the index is valid.", silent=True)
+
 
     @playlist.command(name='play')
     async def playlist_play(ctx, name, *flags):
@@ -305,57 +317,171 @@ def run_bot():
         # Initialize queue for this server if it doesn't exist
         if ctx.guild.id not in queues:
             queues[ctx.guild.id] = []
-        
 
-        if random_mode:
-            if not playlist:
-                await ctx.send(f"Playlist '{name} is empty.", silent=True)
-                return
-        
-            random_song = random.choice(playlist)
+
+        songs_to_add = playlist.copy()
+        if shuffle_mode:
+            random.shuffle(songs_to_add)
+
+        playlist_states[ctx.guild.id] = {
+            'remaining_songs': songs_to_add,
+            'is_random': random_mode
+        }
+
+        songs_to_process = 3 if not random_mode else 1
+
+        for i in range(min(songs_to_process, len(songs_to_add))):
+            song = songs_to_add.pop(0)
 
             try:
                 loop = asyncio.get_event_loop()
-                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(random_song['url'], download=False))
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(song['url'], download=False))
 
                 queue_entry = {
-                    'title': random_song['title'],
+                    'title': song['title'],
                     'url': data.get('url')
                 }
-
                 queues[ctx.guild.id].append(queue_entry)
-                await ctx.send(f"Added random song '{random_song['title']}' from playlist '{name}'")
-            
+
+
             except Exception as e:
-                await ctx.send(f"error encountered... help me")
                 print(e)
 
-        # regular play with optional shuffle
-        else:
-            if shuffle_mode:
-                songs_to_add = playlist.copy()
-                random.shuffle(songs_to_add)
+        playlist_states[ctx.guild.id]['remaining_songs'] = songs_to_add
 
-            for song in songs_to_add:
-                try:
-                    loop = asyncio.get_event_loop()
-                    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(song['url'], download=False))
-
-                    queue_entry = {
-                        'title': song['title'],
-                        'url': data.get('url')
-                    }
-
-                    queues[ctx.guild.id].append(queue_entry)
-                    added_count += 1
-                except Exception as e:
-                    print(e)
-        
-            await ctx.send(f"Added {added_count} songs from playlist '{name}' to the queue", silent=True)
-        
-        # Start playing if not already playing
         if not ctx.voice_client.is_playing():
             play_next(ctx)
+
+
+    async def load_more_songs(ctx, count=2):
+        guild_id = ctx.guild.id
+
+        if guild_id not in playlist_states:
+            return 0
+        
+        state = playlist_states[guild_id]
+        loaded_count = 0
+
+        for _ in range(count):
+            if state['is_random']:
+                remaing = state['remaining_songs']
+                if not remaing:
+                    break
+                song = random.choice(remaing)
+
+            else:
+                if not state['remaining_songs']:
+                    break # no more songs
+                song = state['remaining_songs'].pop(0)
+
+            try:
+                loop = asyncio.get_event_loop()
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(song['url'], download=False))
+
+                queue_entry = {
+                    'title': song['title'],
+                    'url': data.get('url')
+                }
+                queues[guild_id].append(queue_entry)
+                loaded_count += 1
+
+            except Exception as e:
+                print(e)
+                break
+
+        return loaded_count
+
+
+    @playlist.command(name='create-from-url')
+    async def playlist_create_from_url(ctx, name, url):
+        """Create a new playlist from a Youtube playlist URL"""
+
+        if not name or len(name) > 50 or any(c in name for c in '\\/:*?"<>|'):
+            print()
+            return
+
+        if 'list=' not in url:
+            print("not a playlist url")
+            return
+
+        success = await bot.playlist_manager.create_playlist(name)
+        if not success:
+            await ctx.send(f"A playlist named '{name}' already exists!", silent=True)
+            return
+        
+        # Notify user that extraction is starting
+        message = await ctx.send(f"Creating playlist '{name}' from YouTube playlist. This may take a while depending on the size of the playlist...", silent=True)
+
+        playlist_options = {
+            'quiet': True,
+            'extract_flat': 'in_playlist',
+            'skip_download': True,
+            'noplaylist': False,
+            'format': 'none'
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(playlist_options) as playlist_ytdl:
+                loop = asyncio.get_event_loop()
+                playlist_data = await loop.run_in_executor(None, lambda: playlist_ytdl.extract_info(url, download=False))
+
+                if 'entries' not in playlist_data:
+                    await message.edit(content=f"Failed to extract playlist data. Please verify the URL")
+                    await bot.playlist_manager.delete_playlist(name)
+                    return
+                
+                songs_added = 0
+                failed_songs = 0
+                entries = list(filter(None, playlist_data['entries']))
+                total_songs = len(entries)
+
+                if total_songs == 0:
+                    await message.edit(content=f"The YouTube playlist appears to be empty or private. No songs were added.")
+                    await bot.playlist_manager.delete_playlist(name)
+                    return
+                
+                await message.edit(content=f"Found {total_songs} songs in the YouTube playlist. Adding to '{name}'...")
+
+                for entry in entries:
+                    try:
+                        video_id = entry.get('id')
+                        if not video_id:
+                            failed_songs += 1
+                            continue
+
+                        video_url = f"https://www.youtube.com/watch?v={video_id}"
+                        title = entry.get('title', f"Video {video_id}")
+
+                        song = {
+                            'title': title,
+                            'url': video_url
+                        }
+
+                        success = await bot.playlist_manager.add_song_to_playlist(name, song)
+                        if success:
+                            songs_added += 1
+                        else:
+                            failed_songs += 1
+
+                    except Exception as song_error:
+                        print(f"Error adding song: {song_error}")
+                        failed_songs += 1
+
+                # Final update
+                if songs_added > 0:
+                    if failed_songs > 0:
+                        await message.edit(content=f"Added {songs_added} songs to playlist '{name}'. {failed_songs} songs could not be added (possibly duplicates or errors).")
+                    else:
+                        await message.edit(content=f"Successfully added all {songs_added} songs to playlist '{name}'!")
+                else:
+                    await message.edit(content=f"Failed to add any songs to playlist '{name}'. Please check the YouTube playlist.")
+                    await bot.playlist_manager.delete_playlist(name)
+            
+
+        except Exception as e:
+            print(e)
+            # Delete the created playlist if an error occurs
+            await bot.playlist_manager.delete_playlist(name)  
 
     bot.run(TOKEN)
 
