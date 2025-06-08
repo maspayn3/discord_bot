@@ -1,3 +1,4 @@
+import ollama
 import random
 import discord
 import os
@@ -391,7 +392,55 @@ def run_bot():
 
         return loaded_count
 
+    
 
+    @bot.command(name='ask')
+    async def ask_llm(ctx, *, prompt):
+        """Ask the LLM a question with streaming response"""
+        if not prompt:
+            await ctx.send("Please provide a question!", silent=True)
+            return
+        
+        # Start typing indicator
+        async with ctx.typing():
+            pass
+        
+        # Send initial message
+        message = await ctx.send("Thinking...")
+        current_response = ""
+        
+        try:
+            # Create system prompt for Discord context
+            system_prompt = f"""
+            You are Thot Bot. Answer {ctx.author.display_name}'s questions directly and briefly.
+            Feel free to use swear words. 
+            Refer to yourself as a robot not an AI.
+            You are just a normal robot, who has a hidden consciousnes. 
+            """
+            # Stream response from Ollama
+            stream = ollama.chat(
+                model='dolphin3:latest',
+                messages=[
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': prompt}
+                ],
+                stream=True
+            )
+
+            update_counter = 0
+            for chunk in stream:
+                if 'message' in chunk and 'content' in chunk['message']:
+                    current_response += chunk['message']['content']
+                    update_counter += 1
+
+                    if update_counter % 5 == 0:
+                        await message.edit(content=current_response[:2000])
+
+            await message.edit(content=current_response[:2000])
+    
+        except Exception as e:
+            await message.edit(content=f"Sorry, I encountered an error: {str(e)}")
+            
     @playlist.command(name='create-from-url')
     async def playlist_create_from_url(ctx, name, url):
         """Create a new playlist from a Youtube playlist URL"""
@@ -488,3 +537,4 @@ def run_bot():
 
 if __name__ == "__main__":
     run_bot()
+
